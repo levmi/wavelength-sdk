@@ -52,6 +52,38 @@ Whether the browser grants the request depends on its own engagement
 heuristics (installed as a PWA, bookmarked, frequently visited, and similar
 signals). Do not rely on it being granted; treat it as best-effort.
 
+## The runtime cache
+
+Separately from wallet data, the SDK keeps a copy of the daemon's WASM binary in
+**Cache Storage**, in a bucket named `wavelength-runtime-v1`. This is a
+performance cache and holds no wallet state.
+
+It exists because the browser will not keep the module in its HTTP cache. The
+binary is around 20 MB compressed, which is large enough that Chrome declines to
+store it even when it is served with `Cache-Control: immutable` and hits a CDN
+edge, so without a cache of our own every single page load re-downloads the whole
+thing. Once the bytes are local, compiling and instantiating the module takes on
+the order of 100 ms, so on a 50 Mbps connection caching takes the runtime load
+from roughly 3.2 s to under 100 ms.
+
+The cache holds one runtime at a time. Runtime asset URLs carry the version
+(`<base>/<version>/wavewalletdk.wasm.gz`), so upgrading the SDK to a runtime with
+a new `RUNTIME_MANIFEST_VERSION` stores the new binary and drops the old one on
+the first load after the upgrade. A wallet that has been through several upgrades
+holds one copy, not one per release. Budget roughly 130 MB of origin storage for
+it, since what is stored is the decompressed module.
+
+Nothing here is load-bearing. Cache Storage is unavailable outside a [secure
+context](/web/get-started/cross-origin-isolation/) and rejects writes once an
+origin is over quota, and the browser may evict the entry at any time. Every one
+of those cases falls back to downloading the runtime, which is the behavior you
+had before the cache existed. If the origin is evicted or the entry turns out not
+to be usable, the SDK drops it and refetches, so a bad cached copy cannot wedge
+the wallet.
+
+Requesting persistent storage, as above, also makes the browser less likely to
+evict this cache.
+
 ## Main thread vs worker
 
 `createWebClient()` accepts **`runtimeThread`**: `'worker'` (default) or
