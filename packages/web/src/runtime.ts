@@ -4,6 +4,12 @@ import {
   type WavelengthPerformanceListener,
 } from '@lightninglabs/wavelength-core';
 import { performanceNow, reportPerformance } from './performance.ts';
+import {
+  evictRuntimeAsset,
+  matchRuntimeAsset,
+  openRuntimeCache,
+  storeRuntimeAsset,
+} from './runtime-cache.ts';
 import { RUNTIME_ASSETS } from './runtime-manifest.ts';
 
 /**
@@ -123,6 +129,61 @@ export async function instantiateWasm(
 }
 
 /**
+ * Instantiates the module from a copy stored by an earlier visit, or returns
+ * undefined when nothing is cached.
+ *
+ * The cache always holds decompressed wasm, whatever encoding it arrived in, so
+ * this is a plain read and instantiate. Bytes that fail to instantiate are
+ * evicted and reported as a miss, which lets the caller fall back to the
+ * network: a truncated or otherwise broken entry must not be able to wedge the
+ * wallet on every subsequent load.
+ */
+async function instantiateCachedWasm(
+  cache: Cache,
+  url: string,
+  path: string,
+  importObject: WebAssembly.Imports,
+  onPerformance?: WavelengthPerformanceListener,
+) {
+  const cached = await matchRuntimeAsset(cache, url);
+  if (!cached) {
+    return undefined;
+  }
+
+  const readStartedAt = onPerformance ? performanceNow() : undefined;
+  try {
+    const bytes = await cached.arrayBuffer();
+    if (readStartedAt !== undefined) {
+      reportPerformance(onPerformance, {
+        stage: 'runtime',
+        phase: 'wasmCacheRead',
+        durationMs: performanceNow() - readStartedAt,
+        detail: { path, bytes: bytes.byteLength },
+      });
+    }
+
+    const compileStartedAt = onPerformance ? performanceNow() : undefined;
+    try {
+      return await WebAssembly.instantiate(bytes, importObject);
+    } finally {
+      if (compileStartedAt !== undefined) {
+        reportPerformance(onPerformance, {
+          stage: 'runtime',
+          phase: 'wasmCompileInstantiate',
+          durationMs: performanceNow() - compileStartedAt,
+          detail: { path, streaming: false, source: 'cache' },
+        });
+      }
+    }
+  } catch (err) {
+    console.warn(`cached wasm load failed: ${errorMessage(err)}`);
+    await evictRuntimeAsset(cache, url);
+
+    return undefined;
+  }
+}
+
+/**
  * Fetches the gzip-compressed wasm binary, inflates it through a
  * DecompressionStream, and instantiates the resulting bytes.
  */
@@ -132,6 +193,20 @@ export async function instantiateCompressedWasm(
   onPerformance?: WavelengthPerformanceListener,
 ) {
   const url = resolveRuntimeAsset(base, RUNTIME_ASSETS.wasmGz);
+  const cache = await openRuntimeCache();
+  if (cache) {
+    const cached = await instantiateCachedWasm(
+      cache,
+      url,
+      'gzip',
+      importObject,
+      onPerformance,
+    );
+    if (cached) {
+      return cached;
+    }
+  }
+
   const fetchStartedAt = onPerformance ? performanceNow() : undefined;
   const response = await fetch(url);
   if (fetchStartedAt !== undefined) {
@@ -153,6 +228,13 @@ export async function instantiateCompressedWasm(
   // Content-Encoding is not exposed by every cross-origin host. The wasm MIME
   // type is also a signal because a raw .gz asset is normally application/gzip.
   if (contentEncoding.includes('gzip') || contentType === 'application/wasm') {
+    // The transport already inflated the body, so the clone we stash is exactly
+    // the wasm the warm path wants. We deliberately don't await the write:
+    // filling the cache must not slow down the load that fills it.
+    if (cache) {
+      void storeRuntimeAsset(cache, url, response.clone());
+    }
+
     const compileStartedAt = onPerformance ? performanceNow() : undefined;
     try {
       return await WebAssembly.instantiateStreaming(response, importObject);
@@ -193,6 +275,13 @@ export async function instantiateCompressedWasm(
     });
   }
 
+  // Here the host served a plain .gz that we inflated ourselves, so we store the
+  // inflated bytes rather than the response. That keeps one invariant for the
+  // warm path: whatever the encoding on the wire, the cache holds wasm.
+  if (cache) {
+    void storeRuntimeAsset(cache, url, new Response(bytes));
+  }
+
   const compileStartedAt = onPerformance ? performanceNow() : undefined;
   try {
     return await WebAssembly.instantiate(bytes, importObject);
@@ -218,6 +307,20 @@ export async function instantiateRawWasm(
   onPerformance?: WavelengthPerformanceListener,
 ) {
   const url = resolveRuntimeAsset(base, RUNTIME_ASSETS.wasm);
+  const cache = await openRuntimeCache();
+  if (cache) {
+    const cached = await instantiateCachedWasm(
+      cache,
+      url,
+      'raw',
+      importObject,
+      onPerformance,
+    );
+    if (cached) {
+      return cached;
+    }
+  }
+
   const fetchStartedAt = onPerformance ? performanceNow() : undefined;
   const response = await fetch(url);
   if (fetchStartedAt !== undefined) {
@@ -230,6 +333,12 @@ export async function instantiateRawWasm(
   }
   if (!response.ok) {
     throw runtimeAssetError(url);
+  }
+
+  // An uncompressed host serves the wasm as-is, so the body is already what the
+  // warm path wants to instantiate.
+  if (cache) {
+    void storeRuntimeAsset(cache, url, response.clone());
   }
 
   const compileStartedAt = onPerformance ? performanceNow() : undefined;
