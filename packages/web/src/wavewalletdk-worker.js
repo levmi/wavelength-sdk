@@ -218,6 +218,130 @@ function waitForWASMReady() {
   });
 }
 
+// The runtime cache below mirrors runtime-cache.ts. This worker ships as a
+// standalone file the consumer's bundler emits, so it cannot import from the
+// package; keep the two in sync. See that module for why the cache exists at
+// all (short version: the browser refuses to keep a 20 MB wasm module in the
+// HTTP cache, so every load re-downloads it) and for the release-pruning rules.
+const RUNTIME_CACHE_NAME = "wavelength-runtime-v1";
+const RUNTIME_CACHE_PREFIX = "wavelength-runtime-";
+
+function absoluteRuntimeUrl(url) {
+  try {
+    return new Request(url).url;
+  } catch {
+    return url;
+  }
+}
+
+async function openRuntimeCache() {
+  let caches;
+  try {
+    caches = self.caches;
+  } catch {
+    return undefined;
+  }
+  if (!caches) {
+    return undefined;
+  }
+
+  try {
+    const cache = await caches.open(RUNTIME_CACHE_NAME);
+    void dropSupersededCaches(caches);
+
+    return cache;
+  } catch {
+    return undefined;
+  }
+}
+
+async function dropSupersededCaches(caches) {
+  try {
+    const names = await caches.keys();
+    await Promise.all(
+      names
+        .filter(
+          (name) =>
+            name.startsWith(RUNTIME_CACHE_PREFIX) &&
+            name !== RUNTIME_CACHE_NAME,
+        )
+        .map((name) => caches.delete(name)),
+    );
+  } catch {
+    // A cache we cannot enumerate is one we cannot clean up. Harmless.
+  }
+}
+
+async function storeRuntimeAsset(cache, url, response) {
+  try {
+    await cache.put(url, response);
+  } catch {
+    // An origin over quota rejects the write; there is nothing to be done.
+    return false;
+  }
+
+  try {
+    const keep = absoluteRuntimeUrl(url);
+    const stale = (await cache.keys()).filter(
+      (request) => request.url !== keep,
+    );
+    await Promise.all(stale.map((request) => cache.delete(request)));
+  } catch {
+    // Leaving a stale runtime behind costs disk, not correctness.
+  }
+
+  return true;
+}
+
+// instantiateCachedWasm instantiates a copy stored by an earlier visit, or
+// returns undefined when there is nothing usable cached. The cache always holds
+// decompressed wasm, whatever encoding it arrived in, so this is a plain read
+// and instantiate. Bytes that fail to instantiate are evicted and reported as a
+// miss so a broken entry cannot wedge every later load.
+async function instantiateCachedWasm(cache, url, path, importObject) {
+  let cached;
+  try {
+    cached = await cache.match(url);
+  } catch {
+    return undefined;
+  }
+  if (!cached) {
+    return undefined;
+  }
+
+  const readStartedAt = performanceEnabled ? performanceNow() : undefined;
+  try {
+    const bytes = await cached.arrayBuffer();
+    postPerformance("wasmCacheRead", readStartedAt, {
+      path,
+      bytes: bytes.byteLength,
+    });
+
+    const compileStartedAt = performanceEnabled ? performanceNow() : undefined;
+    try {
+      return await WebAssembly.instantiate(bytes, importObject);
+    } finally {
+      postPerformance("wasmCompileInstantiate", compileStartedAt, {
+        path,
+        streaming: false,
+        source: "cache",
+      });
+    }
+  } catch (err) {
+    postEvent("log", {
+      level: "warn",
+      message: `cached wasm load failed: ${String(err?.message || err)}`,
+    });
+    try {
+      await cache.delete(url);
+    } catch {
+      // An entry we cannot delete is one the next load will retry.
+    }
+
+    return undefined;
+  }
+}
+
 async function instantiateWasm(importObject) {
   const startedAt = performanceEnabled ? performanceNow() : undefined;
   let path = "raw";
@@ -243,6 +367,14 @@ async function instantiateWasm(importObject) {
 
 async function instantiateCompressedWasm(importObject) {
   const url = resolveRuntimeAsset("wavewalletdk.wasm.gz");
+  const cache = await openRuntimeCache();
+  if (cache) {
+    const cached = await instantiateCachedWasm(cache, url, "gzip", importObject);
+    if (cached) {
+      return cached;
+    }
+  }
+
   const fetchStartedAt = performanceEnabled ? performanceNow() : undefined;
   const response = await fetch(url);
   postPerformance("wasmFetchHeaders", fetchStartedAt, { path: "gzip" });
@@ -260,6 +392,13 @@ async function instantiateCompressedWasm(importObject) {
   // Content-Encoding is not exposed by every cross-origin host. The wasm MIME
   // type is also a signal because a raw .gz asset is normally application/gzip.
   if (contentEncoding.includes("gzip") || contentType === "application/wasm") {
+    // The transport already inflated the body, so the clone we stash is exactly
+    // the wasm the warm path wants. The write is not awaited: filling the cache
+    // must not slow down the load that fills it.
+    if (cache) {
+      void storeRuntimeAsset(cache, url, response.clone());
+    }
+
     const compileStartedAt = performanceEnabled ? performanceNow() : undefined;
     try {
       return await WebAssembly.instantiateStreaming(response, importObject);
@@ -285,6 +424,13 @@ async function instantiateCompressedWasm(importObject) {
     streaming: false,
   });
 
+  // Here the host served a plain .gz that we inflated ourselves, so we store the
+  // inflated bytes rather than the response. That keeps one invariant for the
+  // warm path: whatever the encoding on the wire, the cache holds wasm.
+  if (cache) {
+    void storeRuntimeAsset(cache, url, new Response(bytes));
+  }
+
   const compileStartedAt = performanceEnabled ? performanceNow() : undefined;
   try {
     return await WebAssembly.instantiate(bytes, importObject);
@@ -298,6 +444,14 @@ async function instantiateCompressedWasm(importObject) {
 
 async function instantiateRawWasm(importObject) {
   const url = resolveRuntimeAsset("wavewalletdk.wasm");
+  const cache = await openRuntimeCache();
+  if (cache) {
+    const cached = await instantiateCachedWasm(cache, url, "raw", importObject);
+    if (cached) {
+      return cached;
+    }
+  }
+
   const fetchStartedAt = performanceEnabled ? performanceNow() : undefined;
   const response = await fetch(url);
   postPerformance("wasmFetchHeaders", fetchStartedAt, { path: "raw" });
@@ -306,6 +460,12 @@ async function instantiateRawWasm(importObject) {
       `Wavelength runtime asset could not be loaded from ${url}. Host the ` +
         "daemon runtime assets and point runtimeBaseUrl at them.",
     );
+  }
+
+  // An uncompressed host serves the wasm as-is, so the body is already what the
+  // warm path wants to instantiate.
+  if (cache) {
+    void storeRuntimeAsset(cache, url, response.clone());
   }
 
   const compileStartedAt = performanceEnabled ? performanceNow() : undefined;
